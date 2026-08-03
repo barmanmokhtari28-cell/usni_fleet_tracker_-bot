@@ -1,0 +1,55 @@
+name: USNI Fleet Tracker Monitor
+
+on:
+  schedule:
+    # Every 15 minutes. GitHub Actions cron is best-effort, not exact —
+    # during high load it can slip by several minutes; that's expected.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Run as a one-off test backfill instead of live monitoring?"
+        type: boolean
+        default: false
+      test_days:
+        description: "If test mode: how many past days of posts to send"
+        type: string
+        default: "30"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: usni-fleet-tracker-monitor
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
+          TEST_DAYS: ${{ github.event.inputs.test_days || '30' }}
+        run: python monitor.py
+
+      - name: Commit updated state (if changed)
+        run: |
+          git config user.name "usni-fleet-tracker-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add state.json test_state.json 2>/dev/null || git add state.json
+          git diff --cached --quiet && echo "No state changes to commit" || git commit -m "Update tracker state [skip ci]"
+          git push
