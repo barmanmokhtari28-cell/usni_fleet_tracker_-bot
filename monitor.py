@@ -19,13 +19,24 @@ to the repo after every run so state persists between scheduled runs.
 --------------------------------------------------------------------
 NOTE ON CLOUDFLARE
 --------------------------------------------------------------------
-news.usni.org sits behind Cloudflare, which challenges plain HTTP
-clients with a "Just a moment..." JS-challenge page before serving
-real content. We use `cloudscraper` (a requests-compatible client
-built specifically to solve this challenge) instead of plain
-`requests` for fetching the feeds. This handles Cloudflare's
-JS-computation challenge; it will NOT get past a CAPTCHA-based
-challenge (Turnstile) if USNI ever escalates to that.
+news.usni.org sits behind Cloudflare. GitHub Actions runners come from
+well-known shared datacenter IP ranges, which some Cloudflare configs
+block outright regardless of headers/JS-solving ability (this shows up
+as an instant 403 "Just a moment..." page, not a real challenge to solve).
+
+To work around this, fetching goes through a chain of strategies,
+in order, until one succeeds:
+  1. Direct fetch via cloudscraper (handles a *real* JS challenge, if
+     that's what's actually happening).
+  2. Fetch via a public read-through proxy (api.allorigins.win), which
+     makes the request from a different IP than GitHub's runners.
+
+If BOTH fail, the run logs exactly that and exits cleanly (no false
+"all good" — see the [feed] log lines). At that point the realistic
+next step is a paid scraping API with Cloudflare bypass (e.g.
+ScraperAPI, ScrapingBee, ZenRows) — this script has an optional
+SCRAPERAPI_KEY hook (see fetch_via_scraperapi) ready to wire in if
+you get a key from one of those.
 
 --------------------------------------------------------------------
 TEST / BACKFILL MODE
@@ -48,6 +59,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -61,8 +73,7 @@ try:
     )
 except ImportError:
     _SCRAPER = None
-    print("[warn] cloudscraper not installed — falling back to plain requests "
-          "(will likely fail against Cloudflare).", file=sys.stderr)
+    print("[warn] cloudscraper not installed — skipping that fetch strategy.", file=sys.stderr)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -82,6 +93,11 @@ STATE_FILE = Path(__file__).parent / (
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# Optional: if you sign up for a Cloudflare-bypass scraping API (ScraperAPI,
+# ScrapingBee, ZenRows, etc.) and add SCRAPERAPI_KEY as a repo secret, this
+# strategy activates automatically as a third fallback. Not required to run.
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
 
 REQUEST_TIMEOUT = 30
 MAX_TELEGRAM_MSG = 4096      # Telegram sendMessage hard cap
@@ -192,44 +208,101 @@ def get_published_epoch(entry) -> float | None:
     return calendar.timegm(struct)
 
 
-def _http_get(url: str):
-    """Use cloudscraper (handles Cloudflare's JS challenge) when available,
-    otherwise fall back to plain requests."""
-    client = _SCRAPER if _SCRAPER is not None else requests
-    return client.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+def _looks_like_cloudflare_block(text: str) -> bool:
+    lowered = text[:500].lower()
+    return "just a moment" in lowered or "cloudflare" in lowered or "cf-browser-verification" in lowered
+
+
+def fetch_via_cloudscraper(url: str):
+    if _SCRAPER is None:
+        return None, "cloudscraper not installed"
+    try:
+        resp = _SCRAPER.get(url, timeout=REQUEST_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"request error: {exc}"
+    if resp.status_code != 200:
+        return None, f"HTTP {resp.status_code}, preview: {resp.text[:200]!r}"
+    if _looks_like_cloudflare_block(resp.text):
+        return None, "got Cloudflare challenge page, not real content"
+    return resp.content, None
+
+
+def fetch_via_allorigins(url: str):
+    """Fetch through a public read-through proxy (different egress IP than
+    GitHub's runners). Free, no API key, but not guaranteed to bypass every
+    Cloudflare config either."""
+    proxied = "https://api.allorigins.win/raw?url=" + urllib.parse.quote(url, safe="")
+    try:
+        resp = requests.get(proxied, timeout=REQUEST_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"request error: {exc}"
+    if resp.status_code != 200:
+        return None, f"HTTP {resp.status_code}, preview: {resp.text[:200]!r}"
+    if _looks_like_cloudflare_block(resp.text):
+        return None, "got Cloudflare challenge page via proxy too"
+    return resp.content, None
+
+
+def fetch_via_scraperapi(url: str):
+    """Only runs if you've added a SCRAPERAPI_KEY repo secret. ScraperAPI
+    (and similar paid services) maintain residential/rotating IPs and
+    handle Cloudflare bypass as their core product — the realistic fix if
+    the free strategies above keep getting blocked."""
+    if not SCRAPERAPI_KEY:
+        return None, "SCRAPERAPI_KEY not set, skipping"
+    proxied = (
+        "https://api.scraperapi.com/?api_key=" + SCRAPERAPI_KEY
+        + "&url=" + urllib.parse.quote(url, safe="")
+    )
+    try:
+        resp = requests.get(proxied, timeout=REQUEST_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"request error: {exc}"
+    if resp.status_code != 200:
+        return None, f"HTTP {resp.status_code}, preview: {resp.text[:200]!r}"
+    if _looks_like_cloudflare_block(resp.text):
+        return None, "got Cloudflare challenge page via ScraperAPI too"
+    return resp.content, None
+
+
+FETCH_STRATEGIES = [
+    ("cloudscraper", fetch_via_cloudscraper),
+    ("allorigins proxy", fetch_via_allorigins),
+    ("scraperapi", fetch_via_scraperapi),
+]
+
+
+def fetch_feed_content(url: str) -> bytes | None:
+    for name, strategy in FETCH_STRATEGIES:
+        content, error = strategy(url)
+        if content is not None:
+            print(f"[feed] {url} — succeeded via {name}")
+            return content
+        print(f"[feed] {url} — {name} failed: {error}", file=sys.stderr)
+    print(
+        f"[feed] {url} — ALL fetch strategies failed. This site is actively "
+        f"blocking automated requests from this IP. Next step: a paid "
+        f"Cloudflare-bypass scraping API (ScraperAPI/ScrapingBee/ZenRows) — "
+        f"add its key as SCRAPERAPI_KEY (or adapt fetch_via_scraperapi for "
+        f"a different provider).",
+        file=sys.stderr,
+    )
+    return None
 
 
 def fetch_all_entries() -> dict:
     """Returns {link: entry} merged across all monitored feeds, de-duped."""
     entries_by_link = {}
     for feed_url in FEED_URLS:
-        try:
-            resp = _http_get(feed_url)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[feed] request failed for {feed_url}: {exc}", file=sys.stderr)
+        raw = fetch_feed_content(feed_url)
+        if raw is None:
             continue
 
-        if resp.status_code != 200:
-            preview = resp.text[:200]
-            hint = ""
-            if "Just a moment" in preview or "cloudflare" in preview.lower():
-                hint = (
-                    " [Cloudflare challenge page — cloudscraper couldn't solve it this "
-                    "time, or USNI has escalated to a CAPTCHA-based challenge.]"
-                )
-            print(
-                f"[feed] {feed_url} returned HTTP {resp.status_code}{hint} "
-                f"body preview: {preview!r}",
-                file=sys.stderr,
-            )
-            continue
-
-        parsed = feedparser.parse(resp.content)
+        parsed = feedparser.parse(raw)
         if parsed.bozo and not parsed.entries:
             print(
                 f"[feed] {feed_url} gave unparsable content "
-                f"(bozo_exception={parsed.get('bozo_exception')}), "
-                f"body preview: {resp.text[:200]!r}",
+                f"(bozo_exception={parsed.get('bozo_exception')})",
                 file=sys.stderr,
             )
             continue
