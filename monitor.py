@@ -52,6 +52,16 @@ FEED_URLS = [
     "https://news.usni.org/tag/fleet-and-marine-tracker/feed/",
 ]
 
+# Some sites block feedparser's default UA (or generic bot UAs) outright.
+# A normal browser UA avoids that class of failure.
+FEED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
+
 TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() == "true"
 TEST_DAYS = int(os.environ.get("TEST_DAYS", "30"))
 
@@ -176,12 +186,31 @@ def fetch_all_entries() -> dict:
     entries_by_link = {}
     for feed_url in FEED_URLS:
         try:
-            parsed = feedparser.parse(feed_url)
+            resp = requests.get(
+                feed_url, headers=FEED_HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"[feed] failed to parse {feed_url}: {exc}", file=sys.stderr)
+            print(f"[feed] request failed for {feed_url}: {exc}", file=sys.stderr)
             continue
+
+        if resp.status_code != 200:
+            print(
+                f"[feed] {feed_url} returned HTTP {resp.status_code}, "
+                f"body preview: {resp.text[:200]!r}",
+                file=sys.stderr,
+            )
+            continue
+
+        parsed = feedparser.parse(resp.content)
         if parsed.bozo and not parsed.entries:
-            print(f"[feed] {feed_url} returned no usable entries (bozo={parsed.bozo})", file=sys.stderr)
+            print(
+                f"[feed] {feed_url} gave unparsable content "
+                f"(bozo_exception={parsed.get('bozo_exception')}), "
+                f"body preview: {resp.text[:200]!r}",
+                file=sys.stderr,
+            )
+            continue
+
         for entry in parsed.entries:
             link = entry.get("link")
             if link and link not in entries_by_link:
