@@ -17,6 +17,17 @@ is kept in state.json, which the GitHub Actions workflow commits back
 to the repo after every run so state persists between scheduled runs.
 
 --------------------------------------------------------------------
+NOTE ON CLOUDFLARE
+--------------------------------------------------------------------
+news.usni.org sits behind Cloudflare, which challenges plain HTTP
+clients with a "Just a moment..." JS-challenge page before serving
+real content. We use `cloudscraper` (a requests-compatible client
+built specifically to solve this challenge) instead of plain
+`requests` for fetching the feeds. This handles Cloudflare's
+JS-computation challenge; it will NOT get past a CAPTCHA-based
+challenge (Turnstile) if USNI ever escalates to that.
+
+--------------------------------------------------------------------
 TEST / BACKFILL MODE
 --------------------------------------------------------------------
 Set env var TEST_MODE=true to do a one-off historical test run:
@@ -43,6 +54,16 @@ from pathlib import Path
 import feedparser
 import requests
 
+try:
+    import cloudscraper
+    _SCRAPER = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+except ImportError:
+    _SCRAPER = None
+    print("[warn] cloudscraper not installed — falling back to plain requests "
+          "(will likely fail against Cloudflare).", file=sys.stderr)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -51,16 +72,6 @@ FEED_URLS = [
     "https://news.usni.org/category/fleet-tracker/feed/",
     "https://news.usni.org/tag/fleet-and-marine-tracker/feed/",
 ]
-
-# Some sites block feedparser's default UA (or generic bot UAs) outright.
-# A normal browser UA avoids that class of failure.
-FEED_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
-}
 
 TEST_MODE = os.environ.get("TEST_MODE", "false").strip().lower() == "true"
 TEST_DAYS = int(os.environ.get("TEST_DAYS", "30"))
@@ -72,7 +83,7 @@ STATE_FILE = Path(__file__).parent / (
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = 30
 MAX_TELEGRAM_MSG = 4096      # Telegram sendMessage hard cap
 MAX_TELEGRAM_CAPTION = 1024  # Telegram sendPhoto caption hard cap
 SNIPPET_KEEP_CHARS = 6000
@@ -181,22 +192,34 @@ def get_published_epoch(entry) -> float | None:
     return calendar.timegm(struct)
 
 
+def _http_get(url: str):
+    """Use cloudscraper (handles Cloudflare's JS challenge) when available,
+    otherwise fall back to plain requests."""
+    client = _SCRAPER if _SCRAPER is not None else requests
+    return client.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+
+
 def fetch_all_entries() -> dict:
     """Returns {link: entry} merged across all monitored feeds, de-duped."""
     entries_by_link = {}
     for feed_url in FEED_URLS:
         try:
-            resp = requests.get(
-                feed_url, headers=FEED_HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True
-            )
+            resp = _http_get(feed_url)
         except Exception as exc:  # noqa: BLE001
             print(f"[feed] request failed for {feed_url}: {exc}", file=sys.stderr)
             continue
 
         if resp.status_code != 200:
+            preview = resp.text[:200]
+            hint = ""
+            if "Just a moment" in preview or "cloudflare" in preview.lower():
+                hint = (
+                    " [Cloudflare challenge page — cloudscraper couldn't solve it this "
+                    "time, or USNI has escalated to a CAPTCHA-based challenge.]"
+                )
             print(
-                f"[feed] {feed_url} returned HTTP {resp.status_code}, "
-                f"body preview: {resp.text[:200]!r}",
+                f"[feed] {feed_url} returned HTTP {resp.status_code}{hint} "
+                f"body preview: {preview!r}",
                 file=sys.stderr,
             )
             continue
