@@ -42,6 +42,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
           TEST_MODE: ${{ github.event.inputs.test_mode || 'false' }}
           TEST_DAYS: ${{ github.event.inputs.test_days || '30' }}
         run: python monitor.py
