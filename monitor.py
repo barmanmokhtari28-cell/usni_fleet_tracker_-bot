@@ -63,13 +63,28 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 REQUEST_TIMEOUT = 20
-MAX_TELEGRAM_MSG = 4000  # stay under Telegram's 4096 char hard cap
+MAX_TELEGRAM_MSG = 4096      # Telegram sendMessage hard cap
+MAX_TELEGRAM_CAPTION = 1024  # Telegram sendPhoto caption hard cap
 SNIPPET_KEEP_CHARS = 6000
+
+# Footer appended to the bottom of every message/caption. Telegram HTML
+# parse_mode is used, so <b>/<i>/etc. render as rich text (not literal tags).
+FOOTER = "\n\n🖲️ <b>@secretollah</b>\n<b>#USNI #ناو</b>"
 
 
 # ---------------------------------------------------------------------------
 # Telegram helpers
 # ---------------------------------------------------------------------------
+
+def with_footer(body: str, limit: int) -> str:
+    """Append FOOTER to body, truncating body (not the footer) if needed so
+    the whole thing fits Telegram's length limit and the footer always
+    survives, sitting underneath everything else."""
+    room_for_body = limit - len(FOOTER)
+    if len(body) > room_for_body:
+        body = body[:room_for_body].rsplit(" ", 1)[0] + "…"
+    return body + FOOTER
+
 
 def send_telegram_message(text: str, disable_preview: bool = False) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -79,7 +94,7 @@ def send_telegram_message(text: str, disable_preview: bool = False) -> None:
         url,
         data={
             "chat_id": TELEGRAM_CHAT_ID,
-            "text": text[:MAX_TELEGRAM_MSG],
+            "text": with_footer(text, MAX_TELEGRAM_MSG),
             "parse_mode": "HTML",
             "disable_web_page_preview": disable_preview,
         },
@@ -97,8 +112,8 @@ def send_telegram_photo(photo_url: str, caption: str) -> bool:
         url,
         data={
             "chat_id": TELEGRAM_CHAT_ID,
+            "caption": with_footer(caption, MAX_TELEGRAM_CAPTION),
             "photo": photo_url,
-            "caption": caption[:1024],  # Telegram photo caption limit
             "parse_mode": "HTML",
         },
         timeout=REQUEST_TIMEOUT,
