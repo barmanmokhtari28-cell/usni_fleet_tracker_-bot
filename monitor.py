@@ -1,49 +1,7 @@
 #!/usr/bin/env python3
 """
 USNI News Fleet and Marine Tracker -> Telegram monitor.
-
-USNI publishes fleet-position updates as a small number of long-lived
-WordPress posts (e.g. "USNI News Fleet and Marine Tracker: July 27, 2026")
-that get SILENTLY EDITED over time as new ship movements are confirmed
-(the site shows "Updated: <date>" on the post). A brand new post also
-appears roughly weekly.
-
-This script therefore watches for TWO kinds of events, not one:
-  1. NEW  - a tracker post we've never seen before
-  2. EDIT - a previously-seen post whose content changed
-
-State (which posts we've seen, and a hash + snippet of their content)
-is kept in state.json, which the GitHub Actions workflow commits back
-to the repo after every run so state persists between scheduled runs.
-
---------------------------------------------------------------------
-BILINGUAL CAPTIONS
---------------------------------------------------------------------
-Every caption shows a Persian translation first, then the original
-English text underneath hidden behind a Telegram spoiler (tap to
-reveal). Translation uses the free MyMemory API (no key required,
-same service used in your other forwarding automations). It has a
-daily quota and can occasionally fail/rate-limit; if it does, the
-script falls back to English-only rather than sending anything broken.
-
---------------------------------------------------------------------
-NOTE ON CLOUDFLARE
---------------------------------------------------------------------
-news.usni.org sits behind Cloudflare. Fetching goes through a chain
-of strategies until one works: cloudscraper, a free read-through
-proxy, then (if you've set SCRAPERAPI_KEY) ScraperAPI.
-
---------------------------------------------------------------------
-TEST / BACKFILL MODE
---------------------------------------------------------------------
-Set env var TEST_MODE=true to do a one-off historical test run:
-  - Sends every tracker post published within the last TEST_DAYS days
-    (default 30) to Telegram, each prefixed "🧪 TEST BACKFILL" so it's
-    unmistakably not a live alert.
-  - Reads/writes a SEPARATE state file (test_state.json), never touching
-    the real state.json. This means running test mode has zero effect
-    on live monitoring — you can test as many times as you want, then
-    just run the workflow normally (TEST_MODE unset) to go live for real.
+Updated with cache-busting, Jina proxy integration, and chronologically sorted processing.
 """
 
 import calendar
@@ -74,7 +32,7 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 
-FEED_URLS = [
+BASE_FEED_URLS = [
     "https://news.usni.org/category/fleet-tracker/feed/",
     "https://news.usni.org/tag/fleet-and-marine-tracker/feed/",
 ]
@@ -88,25 +46,16 @@ STATE_FILE = Path(__file__).parent / (
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-
-# Optional: if you sign up for a Cloudflare-bypass scraping API (ScraperAPI,
-# ScrapingBee, ZenRows, etc.) and add SCRAPERAPI_KEY as a repo secret, this
-# strategy activates automatically as a fallback. Not required to run.
 SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY")
-
-# Optional: a contact email raises MyMemory's free daily translation quota
-# (see mymemory.translated.net docs). Not required.
 MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
 
 REQUEST_TIMEOUT = 30
 TRANSLATE_TIMEOUT = 15
-MAX_TELEGRAM_MSG = 4096      # Telegram sendMessage hard cap
-MAX_TELEGRAM_CAPTION = 1024  # Telegram sendPhoto caption hard cap
+MAX_TELEGRAM_MSG = 4096
+MAX_TELEGRAM_CAPTION = 1024
 SNIPPET_KEEP_CHARS = 6000
-MYMEMORY_CHUNK_CHARS = 450   # stay under MyMemory's ~500-char per-request limit
+MYMEMORY_CHUNK_CHARS = 450
 
-# Footer appended to the bottom of every message/caption. Telegram HTML
-# parse_mode is used, so <b>/<i>/etc. render as rich text (not literal tags).
 FOOTER = "\n\n🖲️ <b>@secretollah</b>\n<b>#USNI #ناو</b>"
 
 
@@ -115,8 +64,6 @@ FOOTER = "\n\n🖲️ <b>@secretollah</b>\n<b>#USNI #ناو</b>"
 # ---------------------------------------------------------------------------
 
 def _chunk_text(text: str, max_len: int) -> list[str]:
-    """Split text into chunks <= max_len, breaking on sentence/word
-    boundaries where possible so translation quality isn't mangled."""
     if len(text) <= max_len:
         return [text] if text else []
     chunks = []
@@ -124,7 +71,7 @@ def _chunk_text(text: str, max_len: int) -> list[str]:
     while len(remaining) > max_len:
         window = remaining[:max_len]
         split_at = max(window.rfind(". "), window.rfind("! "), window.rfind("? "))
-        if split_at < max_len * 0.4:  # no good sentence break, fall back to word break
+        if split_at < max_len * 0.4:
             split_at = window.rfind(" ")
         if split_at <= 0:
             split_at = max_len
@@ -138,9 +85,6 @@ def _chunk_text(text: str, max_len: int) -> list[str]:
 
 
 def translate_to_persian(text: str) -> str | None:
-    """Translate English text to Persian via MyMemory's free API.
-    Returns None (not an exception) on any failure so callers can cleanly
-    fall back to English-only rather than crash or send garbled text."""
     text = (text or "").strip()
     if not text:
         return ""
@@ -156,16 +100,14 @@ def translate_to_persian(text: str) -> str | None:
                 timeout=TRANSLATE_TIMEOUT,
             )
             if not resp.ok:
-                print(f"[translate] MyMemory HTTP {resp.status_code} for chunk", file=sys.stderr)
                 return None
             data = resp.json()
             translated = data.get("responseData", {}).get("translatedText", "")
             if not translated or "MYMEMORY WARNING" in translated.upper():
-                print(f"[translate] MyMemory quota/error: {translated[:150]!r}", file=sys.stderr)
                 return None
             translated_parts.append(translated)
         return " ".join(translated_parts).strip()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"[translate] failed: {exc}", file=sys.stderr)
         return None
 
@@ -175,10 +117,6 @@ def translate_to_persian(text: str) -> str | None:
 # ---------------------------------------------------------------------------
 
 def with_footer(body: str, limit: int) -> str:
-    """Append FOOTER to body, truncating body (not the footer) if needed so
-    the whole thing fits Telegram's length limit. This is a safety-net
-    truncation — build_bilingual_caption already sizes body to fit, so this
-    should rarely need to actually cut anything."""
     room_for_body = limit - len(FOOTER)
     if len(body) > room_for_body:
         body = body[:room_for_body].rsplit(" ", 1)[0] + "…"
@@ -194,22 +132,15 @@ def truncate_plain(text: str, limit: int) -> str:
 
 
 def build_bilingual_caption(tag_line: str, title_en: str, body_en: str, link: str, limit: int) -> str:
-    """Builds: tag line -> bold Persian title+body -> spoiler-hidden
-    original English -> link. Falls back to English-only if translation
-    isn't available, and sizes each language block to fit the given
-    character limit (minus footer, which is added separately by the
-    Telegram send functions via with_footer)."""
     title_fa = translate_to_persian(title_en)
     body_fa = translate_to_persian(body_en)
     have_translation = title_fa is not None and body_fa is not None
 
-    # Reserve room for the footer (added later), the tag line, the link,
-    # and the fixed decorative text/newlines this template always includes.
     fixed_overhead = (
         len(tag_line) + len(link) + len(FOOTER)
-        + len("\n\n") * 4  # spacing between sections
+        + len("\n\n") * 4
         + len("<tg-spoiler></tg-spoiler>")
-        + 40  # safety margin for HTML escaping expansion (&amp; etc.)
+        + 40
     )
     remaining = max(limit - fixed_overhead, 150)
 
@@ -233,7 +164,6 @@ def build_bilingual_caption(tag_line: str, title_en: str, body_en: str, link: st
             f"<tg-spoiler>{html.escape(title_en_t)}\n{html.escape(body_en_t)}</tg-spoiler>"
         )
     else:
-        # Translation unavailable this run — English only, no spoiler split.
         parts.append(f"<b>{html.escape(title_en_t)}</b>\n{html.escape(body_en_t)}")
 
     parts.append(link)
@@ -317,12 +247,11 @@ def get_entry_content(entry) -> str:
     return getattr(entry, "summary", "") or ""
 
 
-def get_published_epoch(entry) -> float | None:
-    """Returns a UTC epoch timestamp for the entry's published date, or None."""
+def get_published_epoch(entry) -> float:
     struct = entry.get("published_parsed") or entry.get("updated_parsed")
     if not struct:
-        return None
-    return calendar.timegm(struct)
+        return 0.0
+    return float(calendar.timegm(struct))
 
 
 def _looks_like_cloudflare_block(text: str) -> bool:
@@ -335,7 +264,7 @@ def fetch_via_cloudscraper(url: str):
         return None, "cloudscraper not installed"
     try:
         resp = _SCRAPER.get(url, timeout=REQUEST_TIMEOUT)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return None, f"request error: {exc}"
     if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}, preview: {resp.text[:200]!r}"
@@ -344,14 +273,29 @@ def fetch_via_cloudscraper(url: str):
     return resp.content, None
 
 
+def fetch_via_jina(url: str):
+    """Free Cloudflare bypass via Jina Reader."""
+    proxied = "https://r.jina.ai/" + url
+    try:
+        resp = requests.get(
+            proxied,
+            headers={"X-Return-Format": "text"},
+            timeout=REQUEST_TIMEOUT
+        )
+    except Exception as exc:
+        return None, f"request error: {exc}"
+    if resp.status_code != 200:
+        return None, f"HTTP {resp.status_code}, preview: {resp.text[:200]!r}"
+    if _looks_like_cloudflare_block(resp.text):
+        return None, "got Cloudflare challenge page via Jina proxy"
+    return resp.content, None
+
+
 def fetch_via_allorigins(url: str):
-    """Fetch through a public read-through proxy (different egress IP than
-    GitHub's runners). Free, no API key, but not guaranteed to bypass every
-    Cloudflare config either."""
     proxied = "https://api.allorigins.win/raw?url=" + urllib.parse.quote(url, safe="")
     try:
         resp = requests.get(proxied, timeout=REQUEST_TIMEOUT)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return None, f"request error: {exc}"
     if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}, preview: {resp.text[:200]!r}"
@@ -361,9 +305,6 @@ def fetch_via_allorigins(url: str):
 
 
 def fetch_via_scraperapi(url: str):
-    """Only runs if you've added a SCRAPERAPI_KEY repo secret. ScraperAPI
-    (and similar paid services) maintain residential/rotating IPs and
-    handle Cloudflare bypass as their core product."""
     if not SCRAPERAPI_KEY:
         return None, "SCRAPERAPI_KEY not set, skipping"
     proxied = (
@@ -372,7 +313,7 @@ def fetch_via_scraperapi(url: str):
     )
     try:
         resp = requests.get(proxied, timeout=REQUEST_TIMEOUT)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return None, f"request error: {exc}"
     if resp.status_code != 200:
         return None, f"HTTP {resp.status_code}, preview: {resp.text[:200]!r}"
@@ -383,6 +324,7 @@ def fetch_via_scraperapi(url: str):
 
 FETCH_STRATEGIES = [
     ("cloudscraper", fetch_via_cloudscraper),
+    ("jina proxy", fetch_via_jina),
     ("allorigins proxy", fetch_via_allorigins),
     ("scraperapi", fetch_via_scraperapi),
 ]
@@ -395,26 +337,27 @@ def fetch_feed_content(url: str) -> bytes | None:
             print(f"[feed] {url} — succeeded via {name}")
             return content
         print(f"[feed] {url} — {name} failed: {error}", file=sys.stderr)
-    print(
-        f"[feed] {url} — ALL fetch strategies failed.",
-        file=sys.stderr,
-    )
+    print(f"[feed] {url} — ALL fetch strategies failed.", file=sys.stderr)
     return None
 
 
-def fetch_all_entries() -> dict:
-    """Returns {link: entry} merged across all monitored feeds, de-duped."""
+def fetch_all_entries() -> list[dict]:
+    """Fetches, deduplicates, and sorts entries chronologically (oldest -> newest)."""
     entries_by_link = {}
-    for feed_url in FEED_URLS:
-        raw = fetch_feed_content(feed_url)
+    cache_bust = int(time.time())
+
+    for base_url in BASE_FEED_URLS:
+        sep = "&" if "?" in base_url else "?"
+        bust_url = f"{base_url}{sep}_nocache={cache_bust}"
+
+        raw = fetch_feed_content(bust_url)
         if raw is None:
             continue
 
         parsed = feedparser.parse(raw)
         if parsed.bozo and not parsed.entries:
             print(
-                f"[feed] {feed_url} gave unparsable content "
-                f"(bozo_exception={parsed.get('bozo_exception')})",
+                f"[feed] {base_url} unparsable (bozo_exception={parsed.get('bozo_exception')})",
                 file=sys.stderr,
             )
             continue
@@ -423,7 +366,10 @@ def fetch_all_entries() -> dict:
             link = entry.get("link")
             if link and link not in entries_by_link:
                 entries_by_link[link] = entry
-    return entries_by_link
+
+    sorted_entries = list(entries_by_link.values())
+    sorted_entries.sort(key=get_published_epoch)
+    return sorted_entries
 
 
 def diff_summary(old_text: str, new_text: str, max_chars: int = 900) -> str:
@@ -464,12 +410,15 @@ def main() -> None:
     updated_count = 0
     skipped_old = 0
 
-    for link, entry in entries.items():
-        if TEST_MODE:
-            published_epoch = get_published_epoch(entry)
-            if published_epoch is not None and published_epoch < cutoff_epoch:
-                skipped_old += 1
-                continue
+    for entry in entries:
+        link = entry.get("link")
+        if not link:
+            continue
+
+        published_epoch = get_published_epoch(entry)
+        if TEST_MODE and published_epoch and published_epoch < cutoff_epoch:
+            skipped_old += 1
+            continue
 
         title = clean_html(entry.get("title", "Untitled"))
         raw_content = get_entry_content(entry)
@@ -498,6 +447,7 @@ def main() -> None:
                 "text_snapshot": text_content[:SNIPPET_KEEP_CHARS],
                 "first_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "last_updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "published_epoch": published_epoch,
             }
 
         elif prior.get("hash") != content_hash:
@@ -517,7 +467,6 @@ def main() -> None:
             state[link]["hash"] = content_hash
             state[link]["text_snapshot"] = text_content[:SNIPPET_KEEP_CHARS]
             state[link]["last_updated"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        # else: unchanged, nothing to do
 
     save_state(state)
     print(f"[main] Done. {new_count} new post(s), {updated_count} update(s), "
