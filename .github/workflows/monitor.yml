@@ -2,9 +2,8 @@ name: USNI Fleet Tracker Monitor
 
 on:
   schedule:
-    # Every 15 minutes. GitHub Actions cron is best-effort, not exact —
-    # during high load it can slip by several minutes; that's expected.
-    - cron: "*/15 * * * *"
+    # Runs at 9:00 AM and 9:00 PM Iran Time (05:30 and 17:30 UTC)
+    - cron: '30 5,17 * * *'
   workflow_dispatch:
     inputs:
       test_mode:
